@@ -1,0 +1,19 @@
+[package]
+name = "transactions_engine"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "transactions_engine"
+
+[dependencies]
+csv = "1.4.0"
+serde = { version = "1.0.228", features = ["derive"] }
+rustc-hash = "2.1.2"
+
+[dev-dependencies]
+criterion = { version = "0.8.2" }
+
+[[bench]]
+name = "transaction_benchmarks"
+harness = false
