@@ -52,12 +52,45 @@ this engine won't allow to withdraw more than currently available amount. (Check
 
 1. No async - in order to handle big traffic of TCP connections sending csv files,
 this engine processes transactions synchronously. Async overhead would slow it down considerably.
-2. To maximize performance, no threading is used in this scenario. I assume ledger as a single source of truth for given csv provider.
+2. To maximize performance, no threading is used in this scenario. I assume this is a single-shot app, ran from CLI, not a tcp server.
 3. Stream processing - non-blocking in memory stream of files. This allows processing even very big files as a stream without crashing.
 4. Parse from bytes to structs - zero alloc csv parsing. This omits standard csv→string_alloc→struct parsing.
 5. Use `FxHashMap` for more performant hasher than standard HashMap.
 6. Amount - for efficient handling of 4-decimal places amounts. Faster than rust-decimal, but very specific for given case. Contains compiler-inlined `checked_add` and `checked_sub` functions for basic operations.
 7. Amount operations guarded with custom `NumericOverflow` error.
+
+## Transform into a TCP server
+
+Fot TCP server, I'd wrap the main in tokio, spawn tokio tasks to handle files and use semaphore/mutex to cap concurrent connections.
+Underneath, I'd create a queue-based producer/consumer with consumer configurable-size worker pool to handle big traffic.
+Rate limiter should also be added - for example, `governor` rust library can handle both per-IP request limits and global limits.
+
+Simple example of underlaying producer/consumer:
+
+```
+use tokio::sync::mpsc;
+let (tx, mut rx) = mpsc::channel::<TcpStream>(QUEUE_DEPTH);
+
+// producer
+tokio::spawn(async move {
+    loop {
+        let (stream, _) = listener.accept().await;
+        if tx.try_send(stream).is_err() {
+            eprintln!("queue full, drop conn...");
+        }
+    }
+});
+
+// consumer
+for _ in 0..WORKER_COUNT {
+    let mut rx = rx.clone(); // sync mechanism needed - e.g. Arc<Mutex<rx>>
+    tokio::spawn(async move {
+        while let Some(stream) = rx.recv().await {
+            process_csv(stream, sink).await;
+        }
+    });
+}
+```
 
 ## AI usage
 
