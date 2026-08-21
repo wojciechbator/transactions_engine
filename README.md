@@ -1,99 +1,73 @@
 # Simple Transactions Engine
 
-## What it does
+A small Rust CLI exercise that streams transaction records from CSV, applies account/dispute state transitions in order, and writes final account balances as CSV.
 
-Processes transactions from csv file, and outputs accounts' balances to csv file.
+Supported operations:
 
-Handles a few basic transactions:
 - deposit
 - withdrawal
 - dispute
 - resolve
 - chargeback
 
-There's a sample transactions.csv file to start with.
+A sample `transactions.csv` is included.
 
 ## Running
 
-To run the main application, use:
+```bash
+cargo run -- transactions.csv > account.csv
+cargo test
+cargo bench --bench transaction_benchmarks
+```
 
-`cargo run -- transactions.csv > account.csv`
+## Processing model
 
-To run unit tests, use:
+```text
+CSV reader
+  -> deserialize one transaction
+  -> validate/apply ordered ledger transition
+  -> update account + transaction history
+  -> continue streaming
+  -> emit final account state
+```
 
-`cargo test`
-
-To run benchmarks, type in terminal:
-
-`cargo bench`
-
-## Rules
-
-1. Deposit - add money to the account
-2. Withdrawal - remove money from the account
-3. Dispute - dispute a transaction
-4. Resolve - resolve a dispute
-5. Chargeback - chargeback a dispute
-
-To simulate real-world scenario, when certain amount is disputed and held, 
-this engine won't allow to withdraw more than currently available amount. (Check out `hold()` function in `account.rs`).
+The implementation assumes input transactions arrive in chronological order. It does not load the entire CSV into memory before processing; the ledger retains only the account state and transaction history required for later dispute/resolve/chargeback operations.
 
 ## Design choices
 
-1. This engine is a CLI application, structured as library.
-2. The flow is CLI command → stream CSV from bytes to structs → process transactions → output accounts state and balance to csv.
-3. Additional Ledger struct holding accounts state and transaction history for chargebacks.
-4. Enum-based error handling and transaction type and state.
-5. Sequential read of transactions from csv - I assume chronological order of transactions.
-6. I feel the library should keep the unit test coverage at least at 80% level, so this repo provides about 84% coverage for the hottest code. To run them, use `cargo test`.
-7. Included benchmark file. To run it, use `cargo bench --bench transaction_benchmarks`.
+- The executable is a thin CLI over library code so the state machine can be tested independently.
+- Transaction and dispute state are represented explicitly with enums rather than stringly-typed branches.
+- Monetary values use a purpose-built fixed-point `Amount` for the required four decimal places, with checked arithmetic and an explicit `NumericOverflow` error.
+- `FxHashMap` is used for in-process lookup-heavy ledger state. This is a local CLI with non-adversarial keys; a network-facing service would need a different threat/performance analysis.
+- Withdrawals are constrained by currently available funds; disputed money moves out of the available balance until resolve/chargeback changes the state.
+- Benchmarks are included to make performance changes measurable rather than assumed.
 
-## Technical choices
+## Why synchronous?
 
-1. No async - in order to handle big traffic of TCP connections sending csv files,
-this engine processes transactions synchronously. Async overhead would slow it down considerably.
-2. To maximize performance, no threading is used in this scenario. I assume this is a single-shot app, ran from CLI, not a tcp server.
-3. Stream processing - non-blocking in memory stream of files. This allows processing even very big files as a stream without crashing.
-4. Parse from bytes to structs - zero alloc csv parsing. This omits standard csv→string_alloc→struct parsing.
-5. Use `FxHashMap` for more performant hasher than standard HashMap.
-6. Amount - for efficient handling of 4-decimal places amounts. Faster than rust-decimal, but very specific for given case. Contains compiler-inlined `checked_add` and `checked_sub` functions for basic operations.
-7. Amount operations guarded with custom `NumericOverflow` error.
+The current workload is a single ordered file feeding one stateful ledger. A synchronous streaming loop keeps the execution model small and preserves transaction order naturally. I have not measured a benefit from adding async or worker concurrency to this CLI, so the implementation does not add either merely for architectural style.
 
-## Transform into a TCP server
+That choice is specific to this workload. A service accepting many independent uploads over the network would have different requirements: asynchronous socket I/O, bounded admission, per-request isolation and controlled CPU concurrency could all be appropriate while each individual ledger still preserves its own ordering guarantees.
 
-Fot TCP server, I'd wrap the main in tokio, spawn tokio tasks to handle files and use semaphore/mutex to cap concurrent connections.
-Underneath, I'd create a queue-based producer/consumer with consumer configurable-size worker pool to handle big traffic.
-Rate limiter should also be added - for example, `governor` rust library can handle both per-IP request limits and global limits.
+## Parsing and allocation
 
-Simple example of underlaying producer/consumer:
+The parser processes records incrementally instead of eagerly materializing the whole input file. The implementation also avoids unnecessary intermediate representations where practical, but this README deliberately does **not** claim allocation-free parsing without allocator-level measurement proving it.
 
+If allocation behaviour becomes important, the benchmark suite should be extended with allocator/profiling evidence before making a stronger claim.
+
+## Turning it into a service
+
+A production network service would need more than wrapping `main` in Tokio. I would separate concerns roughly as follows:
+
+```text
+accept/read request
+  -> bounded admission / request size limits
+  -> parse one independent ledger stream
+  -> ordered ledger execution
+  -> bounded response write
 ```
-use tokio::sync::mpsc;
-let (tx, mut rx) = mpsc::channel::<TcpStream>(QUEUE_DEPTH);
 
-// producer
-tokio::spawn(async move {
-    loop {
-        let (stream, _) = listener.accept().await;
-        if tx.try_send(stream).is_err() {
-            eprintln!("queue full, drop conn...");
-        }
-    }
-});
-
-// consumer
-for _ in 0..WORKER_COUNT {
-    let mut rx = rx.clone(); // sync mechanism needed - e.g. Arc<Mutex<rx>>
-    tokio::spawn(async move {
-        while let Some(stream) = rx.recv().await {
-            process_csv(stream, sink).await;
-        }
-    });
-}
-```
+The outer transport can be asynchronous while the ledger transition logic stays deterministic and synchronous. Concurrency should be capped explicitly rather than tied to the number of incoming sockets, with backpressure/load shedding when the system reaches that limit.
 
 ## AI usage
 
-1. AI generated `benches/transaction_benchmarks.rs` file to measure the code and help me improve performance.
-2. Initially I covered about 45% code with unit tests. Based on already done tests AI generated more tests to cover >= 80% codebase.
-3. Most of in-code docs were generated by AI based on written logic to mimic documented library.
+AI assisted with the benchmark harness, additional test cases and documentation after the core transaction logic was written. The benchmark results and tests are still executable repository artifacts rather than claims that depend on generated prose.
